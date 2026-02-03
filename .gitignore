@@ -1,0 +1,39 @@
+# Data files
+*.xlsx
+*.xls
+*.csv
+*.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.eggs/
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+nul
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Assets (IDE temporary files)
+assets/
