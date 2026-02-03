@@ -4,6 +4,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 import os
 
+# Import data transformation module for new MOLIT API format support
+from data_transformer import auto_transform, detect_format
+
 # 페이지 설정
 st.set_page_config(
     page_title="아파트 실거래가 분석 대시보드",
@@ -95,13 +98,27 @@ def format_price_axis(fig, axis='y', max_value=None):
 # 데이터 로드 및 전처리 함수 (파일 경로용 - 캐시 사용)
 @st.cache_data
 def load_data_from_path(filepath):
-    """파일 경로로부터 데이터 로드 (캐시 사용)"""
+    """파일 경로로부터 데이터 로드 (캐시 사용)
+
+    Automatically detects file format (legacy or new MOLIT API) and
+    transforms to legacy format if necessary for backward compatibility.
+    """
     try:
         df = pd.read_excel(filepath, sheet_name=0)
     except Exception as e:
         st.error(f"파일 로드 중 오류 발생: {str(e)}")
         raise
-    
+
+    # Auto-detect format and transform if necessary
+    try:
+        file_format = detect_format(df)
+        if file_format == "new":
+            df = auto_transform(df)
+            st.info("신규 MOLIT API 형식 파일이 감지되어 자동 변환되었습니다.")
+    except ValueError as e:
+        st.error(f"파일 형식을 인식할 수 없습니다: {str(e)}")
+        raise
+
     # 전처리
     return preprocess_data(df)
 
@@ -147,13 +164,29 @@ def preprocess_data(df):
 
 # 업로드된 파일 로드 함수 (캐시 사용 안 함)
 def load_data_from_upload(uploaded_file):
-    """업로드된 파일로부터 데이터 로드 (캐시 사용 안 함)"""
+    """업로드된 파일로부터 데이터 로드 (캐시 사용 안 함)
+
+    Automatically detects file format (legacy or new MOLIT API) and
+    transforms to legacy format if necessary for backward compatibility.
+    """
     try:
         df = pd.read_excel(uploaded_file, sheet_name=0)
     except Exception as e:
         st.error(f"파일 로드 중 오류 발생: {str(e)}")
         raise
-    
+
+    # Auto-detect format and transform if necessary
+    try:
+        file_format = detect_format(df)
+        if file_format == "new":
+            df = auto_transform(df)
+            st.session_state['file_format_converted'] = True
+        else:
+            st.session_state['file_format_converted'] = False
+    except ValueError as e:
+        st.error(f"파일 형식을 인식할 수 없습니다: {str(e)}")
+        raise
+
     # 전처리
     return preprocess_data(df)
 
@@ -175,6 +208,9 @@ def main():
         try:
             df = load_data_from_upload(uploaded_file)
             st.sidebar.success(f"✅ {uploaded_file.name}")
+            # Show format conversion notification if applicable
+            if st.session_state.get('file_format_converted', False):
+                st.sidebar.info("신규 API 형식 자동 변환됨")
         except Exception as e:
             st.error(f"데이터 파일을 읽는 중 오류가 발생했습니다: {str(e)}\n\n필요한 패키지(openpyxl)가 설치되어 있는지 확인해주세요.")
             st.code("pip install openpyxl", language="bash")
