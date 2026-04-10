@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 import os
 
 # Import data transformation module for new MOLIT API format support
-from data_transformer import auto_transform, detect_format
+from data_transformer import auto_transform, detect_format, detect_property_type, normalize_officetel
 
 # 페이지 설정
 st.set_page_config(
@@ -98,76 +98,86 @@ def format_price_axis(fig, axis='y', max_value=None):
 # 데이터 로드 및 전처리 함수 (파일 경로용 - 캐시 사용)
 @st.cache_data
 def load_data_from_path(filepath):
-    """파일 경로로부터 데이터 로드 (캐시 사용)
-
-    Automatically detects file format (legacy or new MOLIT API) and
-    transforms to legacy format if necessary for backward compatibility.
-    """
+    """파일 경로로부터 데이터 로드 (캐시 사용)"""
     try:
         df = pd.read_excel(filepath, sheet_name=0)
     except Exception as e:
         st.error(f"파일 로드 중 오류 발생: {str(e)}")
         raise
 
-    # Auto-detect format and transform if necessary
-    try:
-        file_format = detect_format(df)
-        if file_format == "new":
-            df = auto_transform(df)
-            st.info("신규 MOLIT API 형식 파일이 감지되어 자동 변환되었습니다.")
-    except ValueError as e:
-        st.error(f"파일 형식을 인식할 수 없습니다: {str(e)}")
-        raise
+    # 부동산 유형 감지 및 정규화
+    property_type = detect_property_type(df)
+    st.session_state['property_type'] = property_type
 
-    # 전처리
-    return preprocess_data(df)
+    if property_type == "아파트매매":
+        try:
+            file_format = detect_format(df)
+            if file_format == "new":
+                df = auto_transform(df)
+        except ValueError as e:
+            st.error(f"파일 형식을 인식할 수 없습니다: {str(e)}")
+            raise
+    else:
+        df = normalize_officetel(df, property_type)
+
+    return preprocess_data(df, property_type)
 
 # 데이터 전처리 함수
-def preprocess_data(df):
-    """데이터프레임 전처리"""
-    
+def preprocess_data(df, property_type="아파트매매"):
+    """데이터프레임 전처리
+
+    property_type: '아파트매매', '오피스텔매매', '오피스텔전월세'
+    """
+
     # 0. 해제사유발생일이 있는 데이터(취소된 거래) 제외
     if '해제사유발생일' in df.columns:
-        # 값이 있는 것으로 간주되는 패턴들: '-'가 아니거나, 공백이 아니거나, 숫자가 있거나
         def is_cancelled(val):
             if pd.isna(val):
                 return False
             val_str = str(val).strip()
-            # '-', '', 'nan', 'None' 등은 데이터가 없는 것으로 간주
             if val_str in ['-', '', 'nan', 'None']:
                 return False
             return True
 
         cancelled_mask = df['해제사유발생일'].apply(is_cancelled)
         cancelled_count = cancelled_mask.sum()
-        
+
         if cancelled_count > 0:
             df = df[~cancelled_mask].copy()
             st.session_state['cancelled_count'] = cancelled_count
         else:
             st.session_state['cancelled_count'] = 0
-    
-    # 1. 거래금액(만원) 숫자 변환
-    if df['거래금액(만원)'].dtype == 'object':
+    else:
+        st.session_state['cancelled_count'] = 0
+
+    # 1. 거래금액(만원) 숫자 변환 (normalize_officetel에서 이미 처리되었을 수 있음)
+    if '거래금액(만원)' in df.columns and df['거래금액(만원)'].dtype == 'object':
         df['거래금액(만원)'] = df['거래금액(만원)'].astype(str).str.replace(',', '').astype(int)
-    
+
     # 2. 날짜 컬럼 생성 (계약년월 + 계약일)
     df['계약일_str'] = df['계약일'].astype(str).str.zfill(2)
     df['거래일자'] = pd.to_datetime(df['계약년월'].astype(str) + df['계약일_str'], format='%Y%m%d')
-    
+
     # 3. 평수 계산 (전용면적 / 3.3)
-    df['평수'] = df['전용면적(㎡)'] / 3.3
-    
-    # 4. 평당가 계산 (거래금액 / 평수)
-    df['평당가(만원)'] = df['거래금액(만원)'] / df['평수']
+    df['평수'] = pd.to_numeric(df['전용면적(㎡)'], errors='coerce') / 3.3
+
+    # 4. 평당가 계산 (거래금액 / 평수) — 전월세는 보증금 기준
+    if '거래금액(만원)' in df.columns:
+        df['평당가(만원)'] = df['거래금액(만원)'] / df['평수']
+
+    # 5. 전월세 전용: 월세 평당가
+    if property_type == "오피스텔전월세" and '월세금(만원)' in df.columns:
+        df['월세평당가(만원)'] = df['월세금(만원)'] / df['평수']
+
     return df
 
 # 업로드된 파일 로드 함수 (캐시 사용 안 함)
 def load_data_from_upload(uploaded_file):
     """업로드된 파일로부터 데이터 로드 (캐시 사용 안 함)
 
-    Automatically detects file format (legacy or new MOLIT API) and
-    transforms to legacy format if necessary for backward compatibility.
+    - 부동산 유형 자동 감지 (아파트매매 / 오피스텔매매 / 오피스텔전월세)
+    - 신규 MOLIT API 형식이면 레거시 형식으로 자동 변환
+    - 오피스텔 파일이면 공통 형식으로 정규화 (건물명→단지명 등)
     """
     try:
         df = pd.read_excel(uploaded_file, sheet_name=0)
@@ -175,47 +185,92 @@ def load_data_from_upload(uploaded_file):
         st.error(f"파일 로드 중 오류 발생: {str(e)}")
         raise
 
-    # Auto-detect format and transform if necessary
-    try:
-        file_format = detect_format(df)
-        if file_format == "new":
-            df = auto_transform(df)
-            st.session_state['file_format_converted'] = True
-        else:
-            st.session_state['file_format_converted'] = False
-    except ValueError as e:
-        st.error(f"파일 형식을 인식할 수 없습니다: {str(e)}")
-        raise
+    # 부동산 유형 감지 (정규화 전에 먼저 감지)
+    property_type = detect_property_type(df)
+    st.session_state['property_type'] = property_type
+
+    # 아파트: 신규 API 형식이면 레거시로 변환
+    if property_type == "아파트매매":
+        try:
+            file_format = detect_format(df)
+            if file_format == "new":
+                df = auto_transform(df)
+                st.session_state['file_format_converted'] = True
+            else:
+                st.session_state['file_format_converted'] = False
+        except ValueError as e:
+            st.error(f"파일 형식을 인식할 수 없습니다: {str(e)}")
+            raise
+    else:
+        # 오피스텔: 공통 형식으로 정규화
+        df = normalize_officetel(df, property_type)
+        st.session_state['file_format_converted'] = False
 
     # 전처리
-    return preprocess_data(df)
+    return preprocess_data(df, property_type)
 
 # 메인 함수
 def main():
-    st.title("📊 아파트 실거래가 상세 분석")
-    
+    title_map = {
+        '아파트매매': "📊 아파트 실거래가 상세 분석",
+        '오피스텔매매': "🏢 오피스텔 매매 실거래가 분석",
+        '오피스텔전월세': "🏢 오피스텔 전월세 실거래 분석",
+    }
+    # 타이틀 placeholder: 파일 로드 후 올바른 유형으로 채움
+    title_placeholder = st.empty()
+
+    # 앱 시작 시 로컬 파일이 없으면 가장 첫 번째 xlsx 자동 선택
+    if 'local_file_path' not in st.session_state:
+        local_xlsx_all = sorted([f for f in os.listdir('.') if f.endswith('.xlsx') or f.endswith('.xls')])
+        if local_xlsx_all:
+            st.session_state['local_file_path'] = os.path.abspath(local_xlsx_all[0])
+
     # 파일 업로드 기능 (접을 수 있게)
     with st.sidebar.expander("📁 파일 업로드", expanded=False):
         uploaded_file = st.file_uploader(
             "Excel 파일 업로드",
             type=['xlsx', 'xls'],
-            help="아파트 실거래가 데이터가 포함된 Excel 파일을 업로드하세요"
+            help="국토교통부 실거래가 공개시스템에서 다운로드한 Excel 파일을 업로드하세요\n(아파트/오피스텔 매매·전월세 모두 지원)"
         )
-    
+
+    # 로컬 파일 빠른 로드 버튼
+    local_xlsx = sorted([f for f in os.listdir('.') if f.endswith('.xlsx') or f.endswith('.xls')])
+    if local_xlsx:
+        with st.sidebar.expander("📂 로컬 파일 불러오기", expanded=True):
+            for fname in local_xlsx:
+                if st.button(fname, key=f"local_{fname}", use_container_width=True):
+                    st.session_state['local_file_path'] = os.path.abspath(fname)
+
+    # 로컬 파일 경로가 선택된 경우 업로드 파일보다 우선
+    local_path = st.session_state.get('local_file_path')
+
     # 파일이 업로드되었는지 확인
-    if uploaded_file is not None:
+    if uploaded_file is not None or local_path:
         # 데이터 로드
         try:
-            df = load_data_from_upload(uploaded_file)
-            st.sidebar.success(f"✅ {uploaded_file.name}")
-            # Show format conversion notification if applicable
+            if uploaded_file is not None:
+                df = load_data_from_upload(uploaded_file)
+                display_name = uploaded_file.name
+            else:
+                df = load_data_from_path(local_path)
+                display_name = os.path.basename(local_path)
+
+            # 로드 후 property_type 확정
+            property_type = st.session_state.get('property_type', '아파트매매')
+            # 올바른 타이틀로 채우기
+            title_placeholder.title(title_map.get(property_type, "📊 실거래가 상세 분석"))
+
+            # 사이드바 상태 표시
+            type_badge = {"아파트매매": "🏠 아파트 매매", "오피스텔매매": "🏢 오피스텔 매매", "오피스텔전월세": "🏢 오피스텔 전월세"}
+            st.sidebar.info(type_badge.get(property_type, property_type))
+            st.sidebar.success(f"✅ {display_name}")
             if st.session_state.get('file_format_converted', False):
                 st.sidebar.info("신규 API 형식 자동 변환됨")
         except Exception as e:
             st.error(f"데이터 파일을 읽는 중 오류가 발생했습니다: {str(e)}\n\n필요한 패키지(openpyxl)가 설치되어 있는지 확인해주세요.")
             st.code("pip install openpyxl", language="bash")
             return
-        
+
         # 데이터가 없는 경우 처리
         if df is None or len(df) == 0:
             st.warning("⚠️ 분석할 수 있는 데이터가 없습니다.")
@@ -225,49 +280,65 @@ def main():
             return
     else:
         # 파일이 업로드되지 않은 경우 초기 화면 표시
+        title_placeholder.title("📊 실거래가 분석 대시보드")
         st.info("👈 왼쪽 사이드바에서 'Excel 파일 업로드'를 통해 분석할 파일을 선택해주세요.")
-        
-        # 안내 이미지 또는 설명 추가
+
         st.markdown("""
         ### 🚀 시작하기
         1. 왼쪽 사이드바의 **파일 업로드** 섹션을 클릭하여 엽니다.
         2. 국토교통부 실거래가 공개시스템에서 다운로드한 **Excel 파일(.xlsx)**을 업로드하세요.
         3. 업로드가 완료되면 자동으로 대시보드가 생성됩니다.
+
+        #### 지원 파일 유형
+        | 유형 | 파일명 예시 |
+        |------|-----------|
+        | 🏠 아파트 매매 | `서울 아파트(매매)_실거래가_....xlsx` |
+        | 🏢 오피스텔 매매 | `서울 오피스텔(매매)_실거래가_....xlsx` |
+        | 🏢 오피스텔 전월세 | `서울 오피스텔(전월세)_실거래가_....xlsx` |
         """)
-        
-        # 예시 데이터가 폴더에 있다면 안내해줄 수도 있음
+
         available_files = [f for f in os.listdir('.') if f.endswith('.xlsx')]
         if available_files:
             st.markdown("---")
             st.markdown("##### 📁 현재 폴더의 데이터 파일 목록")
             for f in available_files:
                 st.write(f"- {f}")
-        
+
         return
-    
+
     # 전체 데이터 건수 표시
     st.sidebar.metric("📊 전체 데이터", f"{len(df):,} 건")
-    
+
     # 취소된 거래 건수 표시 (있는 경우)
     if st.session_state.get('cancelled_count', 0) > 0:
         st.sidebar.warning(f"🚫 취소된 거래 {st.session_state['cancelled_count']}건 제외됨")
-    
+
     # 사이드바 필터
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 🔍 검색 필터")
-    
+
     # 1. 지역 필터 (접을 수 있게)
     regions = sorted(df['시군구'].unique())
     selected_region = regions  # 기본값: 전체 지역
-    
+
     with st.sidebar.expander("📍 지역 선택", expanded=False):
         selected_region = st.multiselect("시군구", regions, default=regions, label_visibility="collapsed")
+
+    # 1-1. 전월세 전용: 전월세구분 필터
+    selected_rent_types = None
+    if property_type == "오피스텔전월세" and '전월세구분' in df.columns:
+        rent_types = sorted(df['전월세구분'].dropna().unique())
+        with st.sidebar.expander("🏷️ 전월세 구분", expanded=False):
+            selected_rent_types = st.multiselect(
+                "전월세구분", rent_types, default=rent_types, label_visibility="collapsed"
+            )
     
-    # 2. 단지명 검색/필터 (접을 수 있게)
+    # 2. 단지(건물)명 검색/필터 (접을 수 있게)
+    complex_label = "건물명 검색" if property_type != "아파트매매" else "단지명 검색"
     all_complexes = sorted(df['단지명'].unique())
     selected_complexes = all_complexes  # 기본값: 전체 단지
-    
-    with st.sidebar.expander("🏢 단지명 검색", expanded=False):
+
+    with st.sidebar.expander(f"🏢 {complex_label}", expanded=False):
         # 단지명 검색 방식 선택
         search_mode = st.radio(
             "검색 방식",
@@ -351,20 +422,23 @@ def main():
         )
     
     # 데이터 필터링 적용
-    # 선택된 지역이 없으면 전체 지역 선택으로 간주
     if not selected_region:
         selected_region = regions
-    
+
     mask = df['시군구'].isin(selected_region)
-    
-    # 단지명 필터 적용
+
+    # 단지(건물)명 필터 적용
     if selected_complexes and len(selected_complexes) < len(all_complexes):
         mask = mask & (df['단지명'].isin(selected_complexes))
-    
+
+    # 전월세 구분 필터 적용
+    if selected_rent_types is not None and len(selected_rent_types) < len(df['전월세구분'].dropna().unique()):
+        mask = mask & (df['전월세구분'].isin(selected_rent_types))
+
     # 날짜 필터 적용
     if len(date_range) == 2:
         mask = mask & (df['거래일자'] >= pd.to_datetime(date_range[0])) & (df['거래일자'] <= pd.to_datetime(date_range[1]))
-    
+
     # 전용면적 필터 적용
     mask = mask & (df['전용면적(㎡)'] >= area_range[0]) & (df['전용면적(㎡)'] <= area_range[1])
     
@@ -403,26 +477,48 @@ def main():
     # --- 0. 요약 대시보드 ---
     with tab0:
         st.subheader("📊 핵심 지표 요약")
-        
+
         # KPI 카드
         col1, col2, col3, col4 = st.columns(4)
-        
+
         with col1:
             total_count = len(filtered_df)
             st.metric("총 거래건수", f"{total_count:,} 건")
-        
+
         with col2:
             avg_price = filtered_df['거래금액(만원)'].mean()
-            st.metric("평균 거래금액", f"{avg_price:,.0f} 만원")
-        
+            if property_type == "오피스텔전월세":
+                st.metric("평균 보증금", f"{avg_price:,.0f} 만원")
+            else:
+                st.metric("평균 거래금액", f"{avg_price:,.0f} 만원")
+
         with col3:
-            avg_price_per_pyeong = filtered_df['평당가(만원)'].mean()
-            st.metric("평균 평당가", f"{avg_price_per_pyeong:,.0f} 만원")
-        
+            if property_type == "오피스텔전월세" and '월세금(만원)' in filtered_df.columns:
+                avg_monthly = filtered_df['월세금(만원)'].mean()
+                st.metric("평균 월세금", f"{avg_monthly:,.0f} 만원")
+            else:
+                avg_price_per_pyeong = filtered_df['평당가(만원)'].mean()
+                st.metric("평균 평당가", f"{avg_price_per_pyeong:,.0f} 만원")
+
         with col4:
             max_price = filtered_df['거래금액(만원)'].max()
             min_price = filtered_df['거래금액(만원)'].min()
-            st.metric("최고가 / 최저가", f"{max_price:,.0f} / {min_price:,.0f} 만원")
+            if property_type == "오피스텔전월세":
+                st.metric("보증금 최고/최저", f"{max_price:,.0f} / {min_price:,.0f} 만원")
+            else:
+                st.metric("최고가 / 최저가", f"{max_price:,.0f} / {min_price:,.0f} 만원")
+
+        # 전월세 전용: 전세/월세 비율
+        if property_type == "오피스텔전월세" and '전월세구분' in filtered_df.columns:
+            st.markdown("---")
+            rent_ratio = filtered_df['전월세구분'].value_counts().reset_index()
+            rent_ratio.columns = ['구분', '건수']
+            col_r1, col_r2 = st.columns([1, 3])
+            with col_r1:
+                st.dataframe(rent_ratio, use_container_width=True, hide_index=True)
+            with col_r2:
+                fig_rent_pie = px.pie(rent_ratio, values='건수', names='구분', title='전세 / 월세 비율')
+                st.plotly_chart(fig_rent_pie, use_container_width=True)
         
         st.markdown("---")
         
@@ -1052,7 +1148,8 @@ def main():
     
     # --- 7. 단지별 분석 ---
     with tab7:
-        st.subheader("아파트 단지별 거래 순위")
+        building_label = "건물" if property_type != "아파트매매" else "단지"
+        st.subheader(f"{building_label}별 거래 순위")
         
         col_apt1, col_apt2 = st.columns(2)
         

@@ -7,6 +7,11 @@ to the legacy format expected by the apartment real transaction dashboard.
 The new MOLIT API format (released 2024-07-17) uses different column names
 and data structures compared to the legacy format. This module provides
 transparent transformation to maintain backward compatibility.
+
+Supported property types:
+- 아파트매매: Apartment sale transactions
+- 오피스텔매매: Officetel sale transactions
+- 오피스텔전월세: Officetel rent transactions (전세/월세)
 """
 
 import pandas as pd
@@ -43,6 +48,71 @@ LEGACY_COLUMNS = {
     "건축년도",         # Year built
     "해제사유발생일",   # Cancellation date
 }
+
+
+def detect_property_type(df: pd.DataFrame) -> str:
+    """
+    Excel 파일의 부동산 유형을 감지합니다.
+
+    Returns:
+        '아파트매매', '오피스텔매매', '오피스텔전월세' 중 하나
+    """
+    columns = set(df.columns)
+
+    # 전월세구분 + 보증금 컬럼 → 전월세 (아파트/오피스텔 공통 패턴)
+    if "전월세구분" in columns and "보증금(만원)" in columns:
+        return "오피스텔전월세"
+
+    # 건물명 있고 단지명 없음 → 오피스텔 (MOLIT 오피스텔 특유 컬럼명)
+    if "건물명" in columns and "단지명" not in columns:
+        return "오피스텔매매"
+
+    # 기본값: 아파트 매매 (단지명 or 신규API 컬럼)
+    return "아파트매매"
+
+
+def normalize_officetel(df: pd.DataFrame, property_type: str) -> pd.DataFrame:
+    """
+    오피스텔 데이터를 대시보드 공통 형식으로 정규화합니다.
+
+    - 건물명 → 단지명 컬럼명 통일
+    - 오피스텔전월세: 보증금(만원)을 거래금액(만원)으로 복사 (차트 호환성)
+    - NO 컬럼 없으면 자동 생성
+
+    Args:
+        df: 원본 오피스텔 DataFrame
+        property_type: '오피스텔매매' 또는 '오피스텔전월세'
+
+    Returns:
+        정규화된 DataFrame
+    """
+    result = df.copy()
+
+    # 건물명 → 단지명 (기존 차트/필터 코드 재사용을 위해)
+    if "건물명" in result.columns and "단지명" not in result.columns:
+        result = result.rename(columns={"건물명": "단지명"})
+
+    # NO 컬럼 없으면 생성
+    if "NO" not in result.columns:
+        result.insert(0, "NO", range(1, len(result) + 1))
+
+    # 전월세: 보증금을 거래금액으로 복사 (기존 차트 재사용)
+    if property_type == "오피스텔전월세":
+        if "보증금(만원)" in result.columns:
+            보증금 = result["보증금(만원)"].astype(str).str.replace(",", "").str.strip()
+            result["거래금액(만원)"] = pd.to_numeric(보증금, errors="coerce").fillna(0).astype(int)
+        if "월세금(만원)" in result.columns:
+            월세금 = result["월세금(만원)"].astype(str).str.replace(",", "").str.strip()
+            result["월세금(만원)"] = pd.to_numeric(월세금, errors="coerce").fillna(0).astype(int)
+
+    # 오피스텔 매매: 거래금액 콤마 제거
+    if property_type == "오피스텔매매" and "거래금액(만원)" in result.columns:
+        if result["거래금액(만원)"].dtype == object:
+            result["거래금액(만원)"] = (
+                result["거래금액(만원)"].astype(str).str.replace(",", "").astype(int)
+            )
+
+    return result
 
 
 def detect_format(df: pd.DataFrame) -> Literal["old", "new"]:
